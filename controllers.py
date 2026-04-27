@@ -67,57 +67,36 @@ class IBVSController:
     Forward-facing, mounted roughly level with the sub body.
     Image convention: u increases rightward, v increases downward.
 
-    IBVS mapping
-    ------------
-    Horizontal pixel error (u_err = pixel_u - target_u):
-        Positive → target is RIGHT of centre → roll RIGHT (sub translates right)
-        Roll keeps heading fixed; sub moves laterally rather than rotating.
+    Two-axis control
+    ----------------
+    Camera Y axis (up/down in image, v_err):
+        Drives heave to match the target's depth.
+        v_err > 0 → target BELOW centre → sub too high → decrease heave (sink).
+        v_err < 0 → target ABOVE centre → sub too low  → increase heave (rise).
 
-        Sign convention (verify on bench):
-            Roll+ = right side UP → thrust tilts LEFT → sub moves LEFT
-            Roll- = right side DOWN → thrust tilts RIGHT → sub moves RIGHT
-            So u_err > 0 needs roll_cmd < 0 → measurement=+u_err on the PID.
+    Camera Z axis (forward, always):
+        A constant nose-down pitch bias drives the sub forward along Z.
+        Pitch tilts the thrust vector forward — the only way to surge with
+        vertical-only thrusters.
 
-    Vertical pixel error (v_err = pixel_v - target_v):
-        Positive → target is BELOW centre → pitch nose DOWN
-        (brings target toward centre AND moves sub forward/down)
-
-    Surge (approach):
-        Once the target is horizontally centred within `centre_deadband_px`,
-        a steady nose-down pitch bias is ramped in to drive the sub forward.
+    Horizontal pixel error (u_err) is ignored — target is always on the forward axis.
     """
 
     def __init__(
         self,
-        image_width: int = 360,
-        image_height: int = 360,
-        roll_kp: float = 0.15,
-        roll_ki: float = 0.0,
-        roll_kd: float = 0.05,
-        pitch_kp: float = 0.15,
-        pitch_ki: float = 0.0,
-        pitch_kd: float = 0.05,
-        # Base PWM that keeps the sub neutrally buoyant — tune on the bench.
-        hover_throttle: float = 128.0,
-        max_roll_authority: float = 60.0,
-        max_pitch_authority: float = 120.0,
-        # Nose-down pitch bias added when target is centred → forward surge.
-        # Set to 0 to disable autonomous approach.
-        surge_pitch_bias: float = 20.0,
-        # Pixel radius considered "centred" before surge engages.
-        centre_deadband_px: float = 10.0,
+        hover_throttle: float    = 128.0,
+        heave_kp: float          = 0.3,
+        heave_ki: float          = 0.0,
+        heave_kd: float          = 0.05,
+        max_heave_correction: float = 30.0,
+        surge_pitch_bias: float  = 30.0,
+        max_pitch_authority: float = 60.0,
     ):
-        self.cx_img = image_width / 2.0
-        self.cy_img = image_height / 2.0
-
         self.hover_throttle = hover_throttle
-        self.max_roll  = max_roll_authority
-        self.max_pitch = max_pitch_authority
-        self.surge_bias = surge_pitch_bias
-        self.deadband = centre_deadband_px
+        self.surge_bias     = surge_pitch_bias
+        self.max_pitch      = max_pitch_authority
 
-        self.roll_pid  = PID(roll_kp,  roll_ki,  roll_kd,  (-max_roll_authority,  max_roll_authority))
-        self.pitch_pid = PID(pitch_kp, pitch_ki, pitch_kd, (-max_pitch_authority, max_pitch_authority))
+        self.heave_pid = PID(heave_kp, heave_ki, heave_kd, (-max_heave_correction, max_heave_correction))
 
     def update(
         self,
@@ -135,24 +114,15 @@ class IBVSController:
             m3 = rear-right
             m4 = rear-left
         """
-        u_err = pixel_u - target_u   # +ve → target is RIGHT of centre
-        v_err = pixel_v - target_v   # +ve → target is BELOW centre
+        v_err = pixel_v - target_v   # +ve → target BELOW centre → sub too high
 
-        # Roll: translate laterally toward horizontal error.
-        # measurement=+u_err → negative output when target is right → Roll- → sub moves right.
-        roll_cmd  = self.roll_pid.update(setpoint=0.0, measurement=u_err)
+        # Heave: PID on v_err matches the sub's depth to the target (camera Y axis).
+        # v_err > 0 → sink → negative correction; v_err < 0 → rise → positive correction.
+        heave_correction = self.heave_pid.update(setpoint=0.0, measurement=v_err)
+        h = float(np.clip(self.hover_throttle + heave_correction, 0, 255))
 
-        # Pitch: tilt camera toward vertical error.
-        pitch_cmd = self.pitch_pid.update(setpoint=0.0, measurement=-v_err)
-
-        # Surge bias: engage a nose-down bias once horizontally centred.
-        horiz_error = abs(u_err)
-        if horiz_error < self.deadband:
-            ramp = 1.0 - (horiz_error / self.deadband)
-            pitch_cmd += self.surge_bias * ramp
-
-        pitch_cmd = float(np.clip(pitch_cmd, -self.max_pitch, self.max_pitch))
-        roll_cmd  = float(np.clip(roll_cmd,  -self.max_roll,  self.max_roll))
+        # Pitch: constant nose-down bias drives forward along camera Z axis.
+        p = float(np.clip(self.surge_bias, -self.max_pitch, self.max_pitch))
 
         # Motor mixing
         #
@@ -160,47 +130,29 @@ class IBVSController:
         #   M4 (RL)   M3 (RR)
         #
         # Heave  : all +h
-        # Pitch+ (nose up)  : rear motors +p, front motors -p
-        # Roll+  (right up) : left motors +r, right motors -r
+        # Pitch+ (nose up)  : rear +p, front -p
         #
-        h = self.hover_throttle
-        p = pitch_cmd
-        r = roll_cmd
+        m1 = h - p   # FL
+        m2 = h - p   # FR
+        m3 = h + p   # RR
+        m4 = h + p   # RL
 
-        m1 = h - p + r   # FL (left)
-        m2 = h - p - r   # FR (right)
-        m3 = h + p - r   # RR (right)
-        m4 = h + p + r   # RL (left)
-
-        motors = [int(np.clip(m, 0, 255)) for m in [m1, m2, m3, m4]]
-        return motors
+        return [int(np.clip(m, 0, 255)) for m in [m1, m2, m3, m4]]
 
     def reset(self):
-        """Call when tracking is lost to clear PID integrators."""
-        self.roll_pid.reset()
-        self.pitch_pid.reset()
+        self.heave_pid.reset()
 
 
 class SubController:
     def __init__(self, depth_sensor, imu, arduino):
 
-        self.depth_pid = PID(2, 0.0, 0.2, (-127, 127))
-        self.roll_pid  = PID(1, 0, 0.5, (-100, 100))
-        self.pitch_pid = PID(1, 0, 0.1, (-100, 100))
-        self.yaw_pid   = PID(1, 0, 0,   (-100, 100))
-
         self.ibvs = IBVSController(
-            image_width=360,
-            image_height=360,
-            roll_kp=0.17,
-            roll_kd=0.07,
-            pitch_kp=0.15,
-            pitch_kd=0.05,
-            hover_throttle=128.0,       # ← tune until sub hovers level
-            max_roll_authority=50.0,
-            max_pitch_authority=60.0,
-            surge_pitch_bias=30.0,      # ← tune forward approach aggressiveness
-            centre_deadband_px=30.0,
+            hover_throttle      = 128.0,  # tune until sub hovers level
+            heave_kp            = 0.3,    # tune: pixels → PWM depth correction
+            heave_kd            = 0.05,
+            max_heave_correction= 30.0,
+            surge_pitch_bias    = 30.0,   # tune: forward approach aggressiveness
+            max_pitch_authority = 60.0,
         )
 
     def update_ibvs(
@@ -225,26 +177,3 @@ class SubController:
         """Call when target is lost to reset PID integrators."""
         self.ibvs.reset()
 
-    def update(self, cur_depth, cur_attitude, target_depth, target_roll, target_pitch, target_yaw):
-        depth = cur_depth or 0
-        roll, pitch, yaw = cur_attitude
-
-        throttle = self.depth_pid.update(target_depth, depth)
-        roll_c   = self.roll_pid.update(target_roll, roll)
-        pitch_c  = self.pitch_pid.update(target_pitch, pitch)
-        yaw_c    = self.yaw_pid.update(target_yaw, yaw)
-
-        m1 = throttle - pitch_c + roll_c - yaw_c + 100
-        m2 = throttle - pitch_c - roll_c + yaw_c + 100
-        m3 = throttle + pitch_c - roll_c - yaw_c + 100
-        m4 = throttle + pitch_c + roll_c + yaw_c + 100
-
-        motors = [int(max(0, min(255, m))) for m in [m1, m2, m3, m4]]
-        return motors
-
-    def send_to_arduino(self, motors):
-        try:
-            signal_string = ",".join(map(str, np.clip(np.array(motors).astype(np.int32), 0, 255))) + "x"
-            self.arduino.send_data(signal_string.encode())
-        except Exception as e:
-            print("Arduino write error:", e)

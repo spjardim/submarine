@@ -153,12 +153,10 @@ if __name__ == "__main__":
                 # NOTE: pixel_v is kept in image convention (y increases downward).
                 # The IBVS Jacobian already accounts for this — no manual flip needed.
                 motors = controller.update_ibvs(
-                    pixel_u=float(u),
-                    pixel_v=float(v),
+                    pixel_u=u,
+                    pixel_v=v,
                     target_u=IMAGE_CENTER_U,
                     target_v=IMAGE_CENTER_V,
-                    sonar_distance=distance if distance and distance > 0.05 else None,
-                    gyro=tuple(gyro),
                 )
                 # ymotors = [255, 255, 255, 0]
                 m3 = motors[0]
