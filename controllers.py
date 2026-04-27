@@ -70,7 +70,13 @@ class IBVSController:
     IBVS mapping
     ------------
     Horizontal pixel error (u_err = pixel_u - target_u):
-        Positive → target is RIGHT of centre → yaw RIGHT
+        Positive → target is RIGHT of centre → roll RIGHT (sub translates right)
+        Roll keeps heading fixed; sub moves laterally rather than rotating.
+
+        Sign convention (verify on bench):
+            Roll+ = right side UP → thrust tilts LEFT → sub moves LEFT
+            Roll- = right side DOWN → thrust tilts RIGHT → sub moves RIGHT
+            So u_err > 0 needs roll_cmd < 0 → measurement=+u_err on the PID.
 
     Vertical pixel error (v_err = pixel_v - target_v):
         Positive → target is BELOW centre → pitch nose DOWN
@@ -85,15 +91,15 @@ class IBVSController:
         self,
         image_width: int = 360,
         image_height: int = 360,
-        yaw_kp: float = 0.15,
-        yaw_ki: float = 0.0,
-        yaw_kd: float = 0.05,
+        roll_kp: float = 0.15,
+        roll_ki: float = 0.0,
+        roll_kd: float = 0.05,
         pitch_kp: float = 0.15,
         pitch_ki: float = 0.0,
         pitch_kd: float = 0.05,
         # Base PWM that keeps the sub neutrally buoyant — tune on the bench.
         hover_throttle: float = 128.0,
-        max_yaw_authority: float = 60.0,
+        max_roll_authority: float = 60.0,
         max_pitch_authority: float = 120.0,
         # Nose-down pitch bias added when target is centred → forward surge.
         # Set to 0 to disable autonomous approach.
@@ -105,12 +111,12 @@ class IBVSController:
         self.cy_img = image_height / 2.0
 
         self.hover_throttle = hover_throttle
-        self.max_yaw = max_yaw_authority
+        self.max_roll  = max_roll_authority
         self.max_pitch = max_pitch_authority
         self.surge_bias = surge_pitch_bias
         self.deadband = centre_deadband_px
 
-        self.yaw_pid   = PID(yaw_kp,   yaw_ki,   yaw_kd,   (-max_yaw_authority,   max_yaw_authority))
+        self.roll_pid  = PID(roll_kp,  roll_ki,  roll_kd,  (-max_roll_authority,  max_roll_authority))
         self.pitch_pid = PID(pitch_kp, pitch_ki, pitch_kd, (-max_pitch_authority, max_pitch_authority))
 
     def update(
@@ -132,21 +138,21 @@ class IBVSController:
         u_err = pixel_u - target_u   # +ve → target is RIGHT of centre
         v_err = pixel_v - target_v   # +ve → target is BELOW centre
 
-        # Yaw: rotate toward horizontal error.
-        # Pass -u_err so the PID drives u_err toward zero.
-        yaw_cmd = self.yaw_pid.update(setpoint=0.0, measurement=-u_err)
+        # Roll: translate laterally toward horizontal error.
+        # measurement=+u_err → negative output when target is right → Roll- → sub moves right.
+        roll_cmd  = self.roll_pid.update(setpoint=0.0, measurement=u_err)
 
         # Pitch: tilt camera toward vertical error.
-        # Nose-down (negative pitch_cmd) when target is below centre.
         pitch_cmd = self.pitch_pid.update(setpoint=0.0, measurement=-v_err)
 
         # Surge bias: engage a nose-down bias once horizontally centred.
         horiz_error = abs(u_err)
         if horiz_error < self.deadband:
-            ramp = 1.0 - (horiz_error / self.deadband)   # 0 → 1 as error → 0
-            pitch_cmd += self.surge_bias * ramp           # nose-down = forward // switching to += og is -=
+            ramp = 1.0 - (horiz_error / self.deadband)
+            pitch_cmd += self.surge_bias * ramp
 
         pitch_cmd = float(np.clip(pitch_cmd, -self.max_pitch, self.max_pitch))
+        roll_cmd  = float(np.clip(roll_cmd,  -self.max_roll,  self.max_roll))
 
         # Motor mixing
         #
@@ -155,24 +161,23 @@ class IBVSController:
         #
         # Heave  : all +h
         # Pitch+ (nose up)  : rear motors +p, front motors -p
-        # Yaw+   (CCW)      : M1/M3 +y, M2/M4 -y  ← flip if yaw is reversed
+        # Roll+  (right up) : left motors +r, right motors -r
         #
         h = self.hover_throttle
         p = pitch_cmd
-        y = yaw_cmd
+        r = roll_cmd
 
-        # TODO: Roll will work better than yaw so that we are always oriented forwards for the location sensors. Yaw pid should always be on to fight movement
-        m1 = h - p + y   # FL
-        m2 = h - p - y   # FR
-        m3 = h + p + y   # RR
-        m4 = h + p - y   # RL
+        m1 = h - p + r   # FL (left)
+        m2 = h - p - r   # FR (right)
+        m3 = h + p - r   # RR (right)
+        m4 = h + p + r   # RL (left)
 
         motors = [int(np.clip(m, 0, 255)) for m in [m1, m2, m3, m4]]
         return motors
 
     def reset(self):
         """Call when tracking is lost to clear PID integrators."""
-        self.yaw_pid.reset()
+        self.roll_pid.reset()
         self.pitch_pid.reset()
 
 
@@ -187,14 +192,14 @@ class SubController:
         self.ibvs = IBVSController(
             image_width=360,
             image_height=360,
-            yaw_kp=0.17, #.15 is og
-            yaw_kd=0.07, #.05 is og
-            pitch_kp=0.15,  #.15 to .10
-            pitch_kd=0.05,  #.05 to .08
-            hover_throttle=128.0,   # ← CRITICAL: tune until sub hovers level
-            max_yaw_authority=50.0, #50
-            max_pitch_authority=60.0, #was 60 to 40
-            surge_pitch_bias=30.0,  # ← tune forward approach aggressiveness was 30 to 25
+            roll_kp=0.17,
+            roll_kd=0.07,
+            pitch_kp=0.15,
+            pitch_kd=0.05,
+            hover_throttle=128.0,       # ← tune until sub hovers level
+            max_roll_authority=50.0,
+            max_pitch_authority=60.0,
+            surge_pitch_bias=30.0,      # ← tune forward approach aggressiveness
             centre_deadband_px=30.0,
         )
 
