@@ -20,6 +20,13 @@ PLAYBACK_MODE = args.playback is not None
 # ---------------------------
 # CONFIG (tune these defaults)
 # ---------------------------
+
+model = np.load("color_model.npz")
+
+MEAN    = model["mean"]
+INV_COV = model["inv_cov"]
+USE_LAB = bool(model["use_lab"])
+
 LOWER_HSV = np.array([0, 120, 20])
 UPPER_HSV  = np.array([50, 255, 200])
 RESOLUTION = (320, 240)
@@ -29,30 +36,15 @@ KERNEL_SIZE = 5
 # ---------------------------
 # TRACKBARS
 # ---------------------------
-TUNING_WINDOW = "HSV Tuning"
-cv2.namedWindow(TUNING_WINDOW)
-
+cv2.namedWindow("Replay")
+cv2.createTrackbar("Threshold", "Replay", 12, 50, lambda x: None)
 def nothing(x): pass
 
-cv2.createTrackbar("H Low",  TUNING_WINDOW, int(LOWER_HSV[0]), 179, nothing)
-cv2.createTrackbar("S Low",  TUNING_WINDOW, int(LOWER_HSV[1]), 255, nothing)
-cv2.createTrackbar("V Low",  TUNING_WINDOW, int(LOWER_HSV[2]), 255, nothing)
-cv2.createTrackbar("H High", TUNING_WINDOW, int(UPPER_HSV[0]), 179, nothing)
-cv2.createTrackbar("S High", TUNING_WINDOW, int(UPPER_HSV[1]), 255, nothing)
-cv2.createTrackbar("V High", TUNING_WINDOW, int(UPPER_HSV[2]), 255, nothing)
-
 # Invisible 1x1 image so the trackbar window actually renders
-cv2.imshow(TUNING_WINDOW, np.zeros((1, 300, 3), dtype=np.uint8))
+cv2.imshow("Replay", np.zeros((1, 300, 3), dtype=np.uint8))
 
-def get_hsv_from_trackbars():
-    hl = cv2.getTrackbarPos("H Low",  TUNING_WINDOW)
-    sl = cv2.getTrackbarPos("S Low",  TUNING_WINDOW)
-    vl = cv2.getTrackbarPos("V Low",  TUNING_WINDOW)
-    hh = cv2.getTrackbarPos("H High", TUNING_WINDOW)
-    sh = cv2.getTrackbarPos("S High", TUNING_WINDOW)
-    vh = cv2.getTrackbarPos("V High", TUNING_WINDOW)
-    return np.array([hl, sl, vl]), np.array([hh, sh, vh])
-
+def get_threshold():
+    return cv2.getTrackbarPos("Threshold", "Replay")
 # ---------------------------
 # SHARED PROCESSING FUNCTION
 # ---------------------------
@@ -60,17 +52,29 @@ kernel = np.ones((KERNEL_SIZE, KERNEL_SIZE), np.uint8)
 prev_cx, prev_cy = None, None
 alpha = 0.7  # smoothing factor
 
+def normalize(img):
+    img = img.astype(np.float32)
+    mean = np.mean(img, axis=(0,1), keepdims=True)
+    img = img / (mean + 1e-6)
+    img = np.clip(img * 128, 0, 255)
+    return img.astype(np.uint8)
+
 def process_frame(frame):
-    """
-    Run color segmentation on a BGR frame using current trackbar HSV values.
-    Returns (annotated_frame, mask, cx, cy) where cx/cy are None if not detected.
-    """
     global prev_cx, prev_cy
 
-    lower, upper = get_hsv_from_trackbars()
+    # IMPORTANT: match training (no normalization unless you trained with it)
 
-    hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, lower, upper)
+    if USE_LAB:
+        cs = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    else:
+        cs = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    diff = cs.astype(np.float32) - MEAN
+    dist = np.einsum('...i,ij,...j->...', diff, INV_COV, diff)
+
+    THRESHOLD = get_threshold()
+    mask = ((dist < THRESHOLD) * 255).astype(np.uint8)
+
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
@@ -80,7 +84,7 @@ def process_frame(frame):
     annotated = frame.copy()
 
     if contours:
-        c    = max(contours, key=cv2.contourArea)
+        c = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(c)
 
         if area > MIN_AREA:
@@ -97,14 +101,6 @@ def process_frame(frame):
 
                 cv2.drawContours(annotated, [c], -1, (0, 255, 0), 2)
                 cv2.circle(annotated, (cx, cy), 5, (0, 0, 255), -1)
-                cv2.putText(annotated, f"({cx},{cy})", (cx + 8, cy - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-
-    lower_cur, upper_cur = get_hsv_from_trackbars()
-    cv2.putText(annotated,
-                f"HSV Low: {lower_cur}  High: {upper_cur}",
-                (5, annotated.shape[0] - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
     return annotated, mask, cx, cy
 
@@ -188,11 +184,7 @@ if PLAYBACK_MODE:
         # any other key: stay on same frame (lets you tweak trackbars while paused in step mode)
 
     # Print final HSV values for copy-paste into your config
-    lower_final, upper_final = get_hsv_from_trackbars()
-    print("\n=== Final HSV values ===")
-    print(f"LOWER_HSV = np.array({lower_final.tolist()})")
-    print(f"UPPER_HSV  = np.array({upper_final.tolist()})")
-
+    print(f"\nFinal Threshold: {get_threshold()}")
     cv2.destroyAllWindows()
 
 # ===========================================================
